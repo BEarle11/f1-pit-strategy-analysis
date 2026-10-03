@@ -1,1 +1,0 @@
-# f1-pit-strategy-analysis
