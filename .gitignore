@@ -1,4 +1,4 @@
 .DS_Store
 .env
 .venv/
-fastf1_cache/
+openf1_cache/
