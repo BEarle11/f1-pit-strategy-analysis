@@ -87,8 +87,13 @@ def fetch(endpoint: str, use_cache: bool = True, **params) -> pd.DataFrame:
         return pd.DataFrame(json.loads(cache_file.read_text()))
 
     resp = requests.get(f"{API}/{endpoint}", params=params, timeout=30)
-    resp.raise_for_status()  # turn HTTP errors (404, 500...) into Python errors
-    data = resp.json()
+    if resp.status_code == 404:
+        # OpenF1 answers "404 Not Found" when a query has no results,
+        # e.g. races where it never recorded pit stops. Treat that as "no rows".
+        data = []
+    else:
+        resp.raise_for_status()  # any other HTTP error (500, 429...) is a real failure
+        data = resp.json()
     if use_cache and data:  # never cache an empty answer; the data may arrive later
         cache_file.write_text(json.dumps(data))
     time.sleep(0.5)  # stay well under OpenF1's free rate limit

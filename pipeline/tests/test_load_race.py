@@ -95,6 +95,27 @@ def test_missing_lap_time_becomes_null(df):
     assert pd.isna(lap(df, "NOR", 1).LAP_TIME_SEC)
 
 
+def test_race_without_pit_data_still_transforms():
+    raw = make_raw()
+    raw["pits"] = pd.DataFrame()  # what fetch() returns when OpenF1 answers 404
+    df = lr.transform(raw, 2023, 1)
+    assert df.PIT_LANE_SEC.isna().all()
+    assert lap(df, "NOR", 11).PIT_OUT  # pit laps still come from the lap data
+    lr.check_quality(df)
+
+
+def test_fetch_treats_404_as_no_rows(monkeypatch, tmp_path):
+    class Resp:
+        status_code = 404
+        def raise_for_status(self):
+            raise AssertionError("404 should not raise")
+    monkeypatch.setattr(lr, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(lr.requests, "get", lambda *a, **k: Resp())
+    monkeypatch.setattr(lr.time, "sleep", lambda s: None)
+    assert lr.fetch("pit", session_key=1).empty
+    assert not list(tmp_path.iterdir())  # empty answers are never cached
+
+
 def test_empty_laps_means_no_data_yet():
     raw = make_raw()
     raw["laps"] = pd.DataFrame()
