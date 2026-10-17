@@ -1,9 +1,11 @@
 """
-load_race.py - Load one F1 race's lap-by-lap data from the OpenF1 API into Snowflake.
+load_race.py - Load F1 race lap-by-lap data from the OpenF1 API into Snowflake.
 
 Usage (from PyCharm's terminal):
     python load_race.py 2026 1             # load round 1 of the 2026 season
     python load_race.py 2026 1 --replace   # delete that race's rows and reload it
+    python load_race.py --auto             # load every finished 2026 race not yet in Snowflake
+    python load_race.py --auto --year 2025 # same, for another season
 
 The pipeline has three stages, the classic ETL pattern:
     1. EXTRACT   - download the race's laps, tire stints, pit stops and drivers from OpenF1
@@ -36,6 +38,7 @@ from snowflake.connector.pandas_tools import write_pandas
 TABLE = "FF1_LAPS"
 API = "https://api.openf1.org/v1"
 CACHE_DIR = Path(__file__).parent / "openf1_cache"  # raw API responses are saved here
+HOURS_AFTER_RACE = 3  # wait this long after a race ends before loading it
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("load_race")
@@ -67,48 +70,60 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 """
 
 
+class NoDataYet(Exception):
+    """OpenF1 has no lap data for this race yet. Not a failure; try again later."""
+
+
 # ---------------------------------------------------------------------------
 # 1. EXTRACT
 # ---------------------------------------------------------------------------
-def fetch(endpoint: str, **params) -> pd.DataFrame:
+def fetch(endpoint: str, use_cache: bool = True, **params) -> pd.DataFrame:
     """Call one OpenF1 endpoint, reusing a saved copy if we already downloaded it."""
     CACHE_DIR.mkdir(exist_ok=True)
     key = endpoint + "_" + "_".join(f"{k}-{v}" for k, v in sorted(params.items()))
     cache_file = CACHE_DIR / f"{key}.json"
 
-    if cache_file.exists():
-        data = json.loads(cache_file.read_text())
-    else:
-        resp = requests.get(f"{API}/{endpoint}", params=params, timeout=30)
-        resp.raise_for_status()  # turn HTTP errors (404, 500...) into Python errors
-        data = resp.json()
+    if use_cache and cache_file.exists():
+        return pd.DataFrame(json.loads(cache_file.read_text()))
+
+    resp = requests.get(f"{API}/{endpoint}", params=params, timeout=30)
+    resp.raise_for_status()  # turn HTTP errors (404, 500...) into Python errors
+    data = resp.json()
+    if use_cache and data:  # never cache an empty answer; the data may arrive later
         cache_file.write_text(json.dumps(data))
-        time.sleep(0.5)  # stay well under OpenF1's free rate limit
+    time.sleep(0.5)  # stay well under OpenF1's free rate limit
     return pd.DataFrame(data)
 
 
-def find_race(year: int, rnd: int) -> pd.Series:
-    """Find the race session for a season and round number."""
-    races = fetch("sessions", year=year, session_name="Race")
+def season_races(year: int) -> pd.DataFrame:
+    """Return the season's races in date order with a ROUND column (1, 2, 3...).
+
+    Cancelled races are skipped, so round numbers match the official calendar.
+    The schedule is always fetched fresh, since it can change during a season.
+    """
+    races = fetch("sessions", use_cache=False, year=year, session_name="Race")
     if races.empty:
         raise ValueError(f"No races found for {year}.")
-
-    # Rounds are the races in date order, skipping any that were cancelled.
     if "is_cancelled" in races:
         races = races[races["is_cancelled"] != True]  # noqa: E712
     races = races.sort_values("date_start").reset_index(drop=True)
-
-    if not 1 <= rnd <= len(races):
-        raise ValueError(f"{year} has {len(races)} races so far; round {rnd} doesn't exist yet.")
-    return races.iloc[rnd - 1]
+    races["ROUND"] = races.index + 1
+    return races
 
 
-def extract(year: int, rnd: int) -> dict:
-    race = find_race(year, rnd)
+def finished_rounds(races: pd.DataFrame, now: pd.Timestamp) -> list[int]:
+    """Rounds whose race ended at least HOURS_AFTER_RACE hours before `now`."""
+    ended = pd.to_datetime(races["date_end"], utc=True)
+    done = ended <= now - pd.to_timedelta(HOURS_AFTER_RACE, unit="h")
+    return races.loc[done, "ROUND"].tolist()
+
+
+def extract(race: pd.Series) -> dict:
     key = int(race["session_key"])
     meeting = fetch("meetings", meeting_key=int(race["meeting_key"]))
     event_name = meeting["meeting_name"].iloc[0] if not meeting.empty else race["location"]
-    log.info("Loading %s %s (round %s, session %s)...", year, event_name, rnd, key)
+    log.info("Loading %s %s (round %s, session %s)...",
+             race["year"], event_name, race["ROUND"], key)
 
     return {
         "session_key": key,
@@ -127,7 +142,7 @@ def transform(raw: dict, year: int, rnd: int) -> pd.DataFrame:
     """Combine laps, stints, pit stops and drivers into one table matching FF1_LAPS."""
     laps = raw["laps"]
     if laps.empty:
-        raise ValueError("No lap data. Has this race happened yet?")
+        raise NoDataYet("No lap data yet. Has this race happened?")
 
     laps = laps.sort_values(["driver_number", "lap_number"]).reset_index(drop=True)
 
@@ -220,9 +235,10 @@ def check_quality(df: pd.DataFrame) -> None:
 # 3. LOAD
 # ---------------------------------------------------------------------------
 def get_connection():
-    """Connect to Snowflake using credentials from the .env file."""
+    """Connect to Snowflake. Credentials come from .env locally, or from
+    GitHub Secrets (as environment variables) when running in GitHub Actions."""
     load_dotenv()
-    return snowflake.connector.connect(
+    conn = snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         user=os.environ["SNOWFLAKE_USER"],
         password=os.environ["SNOWFLAKE_PAT"],  # programmatic access token
@@ -230,58 +246,107 @@ def get_connection():
         database="F1_PROJECT",
         schema="RAW",
     )
+    conn.cursor().execute(CREATE_TABLE_SQL)
+    return conn
 
 
-def load(df: pd.DataFrame, year: int, rnd: int, replace: bool) -> None:
+def loaded_rounds(conn, year: int) -> set[int]:
+    """Which rounds of this season are already in Snowflake."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT DISTINCT RACE_ROUND FROM {TABLE} WHERE SEASON = %s", (year,))
+    return {row[0] for row in cur.fetchall()}
+
+
+def load(conn, df: pd.DataFrame, year: int, rnd: int, replace: bool) -> None:
+    cur = conn.cursor()
+
+    # Idempotency: refuse to load the same race twice unless asked to.
+    # The %s placeholders let the connector insert values safely.
+    cur.execute(
+        f"SELECT COUNT(*) FROM {TABLE} WHERE SEASON = %s AND RACE_ROUND = %s",
+        (year, rnd),
+    )
+    existing = cur.fetchone()[0]
+    if existing and not replace:
+        log.info("Already loaded (%d rows). Use --replace to reload. Nothing to do.", existing)
+        return
+    if existing:
+        cur.execute(f"DELETE FROM {TABLE} WHERE SEASON = %s AND RACE_ROUND = %s", (year, rnd))
+        log.info("Deleted %d old rows.", existing)
+
+    success, _, nrows, _ = write_pandas(conn, df, TABLE, quote_identifiers=False)
+    if not success:
+        raise RuntimeError("Snowflake reported a failed load.")
+    log.info("Loaded %d rows into %s.", nrows, TABLE)
+
+
+def run_one(conn, race: pd.Series, replace: bool = False) -> None:
+    """Extract, transform, check and load a single race."""
+    year, rnd = int(race["year"]), int(race["ROUND"])
+    df = transform(extract(race), year, rnd)
+    check_quality(df)
+    load(conn, df, year, rnd, replace)
+
+
+# ---------------------------------------------------------------------------
+# Run modes
+# ---------------------------------------------------------------------------
+def run_manual(year: int, rnd: int, replace: bool) -> int:
+    races = season_races(year)
+    if not 1 <= rnd <= len(races):
+        raise ValueError(f"{year} has {len(races)} races; round {rnd} doesn't exist.")
     conn = get_connection()
     try:
-        cur = conn.cursor()
-        cur.execute(CREATE_TABLE_SQL)
-
-        # Idempotency: refuse to load the same race twice unless asked to.
-        # The %s placeholders let the connector insert values safely.
-        cur.execute(
-            f"SELECT COUNT(*) FROM {TABLE} WHERE SEASON = %s AND RACE_ROUND = %s",
-            (year, rnd),
-        )
-        existing = cur.fetchone()[0]
-        if existing and not replace:
-            log.info("Already loaded (%d rows). Use --replace to reload. Nothing to do.", existing)
-            return
-        if existing:
-            cur.execute(
-                f"DELETE FROM {TABLE} WHERE SEASON = %s AND RACE_ROUND = %s",
-                (year, rnd),
-            )
-            log.info("Deleted %d old rows.", existing)
-
-        success, _, nrows, _ = write_pandas(conn, df, TABLE, quote_identifiers=False)
-        if not success:
-            raise RuntimeError("Snowflake reported a failed load.")
-        log.info("Loaded %d rows into %s.", nrows, TABLE)
+        run_one(conn, races.iloc[rnd - 1], replace)
     finally:
         conn.close()  # always close the connection, even after an error
+    return 0
 
 
-# ---------------------------------------------------------------------------
-# Run the steps in order
-# ---------------------------------------------------------------------------
+def run_auto(year: int) -> int:
+    """Load every finished race of the season that isn't in Snowflake yet."""
+    races = season_races(year)
+    done = finished_rounds(races, pd.Timestamp.now(tz="UTC"))
+
+    conn = get_connection()
+    try:
+        todo = [r for r in done if r not in loaded_rounds(conn, year)]
+        log.info("%s: %d races finished, %d to load: %s", year, len(done), len(todo), todo)
+
+        failures = 0
+        for rnd in todo:
+            try:
+                run_one(conn, races.iloc[rnd - 1])
+            except NoDataYet as exc:
+                log.warning("Round %s skipped: %s Will retry next run.", rnd, exc)
+            except Exception as exc:  # keep going so one bad race doesn't block the rest
+                log.error("Round %s failed: %s", rnd, exc)
+                failures += 1
+    finally:
+        conn.close()
+    return 1 if failures else 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Load one F1 race into Snowflake.")
-    parser.add_argument("year", type=int, help="season, 2023 or later")
-    parser.add_argument("round", type=int, help="round number in that season, e.g. 1")
-    parser.add_argument("--replace", action="store_true", help="reload a race already in Snowflake")
+    parser = argparse.ArgumentParser(description="Load F1 races into Snowflake.")
+    parser.add_argument("year", type=int, nargs="?", help="season, 2023 or later")
+    parser.add_argument("round", type=int, nargs="?", help="round number, e.g. 1")
+    parser.add_argument("--replace", action="store_true", help="reload a race already loaded")
+    parser.add_argument("--auto", action="store_true",
+                        help="load every finished race not yet in Snowflake")
+    parser.add_argument("--year", dest="auto_year", type=int,
+                        help="season for --auto (default: current year)")
     args = parser.parse_args()
 
     try:
-        raw = extract(args.year, args.round)
-        df = transform(raw, args.year, args.round)
-        check_quality(df)
-        load(df, args.year, args.round, args.replace)
+        if args.auto:
+            return run_auto(args.auto_year or pd.Timestamp.now(tz="UTC").year)
+        if args.year is None or args.round is None:
+            parser.error("give a year and round, or use --auto")
+        return run_manual(args.year, args.round, args.replace)
     except Exception as exc:
         log.error("Pipeline failed: %s", exc)
-        return 1  # a non-zero exit code tells schedulers (like GitHub Actions) it failed
-    return 0
+        return 1  # a non-zero exit code tells GitHub Actions the run failed
 
 
 if __name__ == "__main__":

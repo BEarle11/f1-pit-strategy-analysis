@@ -1,0 +1,46 @@
+# Runs the F1 pipeline automatically after each race weekend.
+# Place this file at  .github/workflows/load_races.yml  in the ROOT of your repo.
+
+name: Load new F1 races
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # every Monday at 09:00 UTC (5 a.m. Eastern), after every race
+  workflow_dispatch:       # adds a "Run workflow" button in GitHub for manual runs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pipeline/requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -v
+
+  load:
+    needs: test            # only load data if every test passed
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pipeline/requirements*.txt
+      - run: pip install -r requirements.txt
+      - name: Load finished races into Snowflake
+        run: python load_race.py --auto
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}

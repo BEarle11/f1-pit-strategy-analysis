@@ -2,3 +2,6 @@
 .env
 .venv/
 openf1_cache/
+__pycache__/
+.pytest_cache/
+.idea/
