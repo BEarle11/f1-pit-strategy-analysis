@@ -27,6 +27,8 @@ jobs:
   load:
     needs: test            # only load data if every test passed
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # lets this job commit the refreshed app data
     defaults:
       run:
         working-directory: pipeline
@@ -44,3 +46,25 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
+
+      - name: Export data for the Streamlit app
+        run: python export_app_data.py
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
+
+      # Commit the new data files only if they changed. Streamlit Community Cloud
+      # redeploys the app automatically whenever the repo changes.
+      - name: Commit refreshed app data
+        working-directory: .
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/data
+          if git diff --cached --quiet; then
+            echo "No new race data; nothing to commit."
+          else
+            git commit -m "Refresh app data after new races"
+            git push
+          fi
