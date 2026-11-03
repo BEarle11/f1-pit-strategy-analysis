@@ -191,3 +191,68 @@ def upcoming_races(year: int) -> pd.DataFrame:
     races["date_start"] = pd.to_datetime(races["date_start"], utc=True)
     races = races[races["date_start"] > pd.Timestamp.now(tz="UTC")].sort_values("date_start")
     return races[["meeting_name", "circuit_short_name", "date_start"]].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Recommendations for every team (used by pipeline/build_insights.py)
+# ---------------------------------------------------------------------------
+SOFT_SOURCES = ("historical", "this season")
+
+
+def team_params(team: str, team_wear: pd.DataFrame, field: pd.Series, soft: pd.Series,
+                wear_factor: float, which: str = "pooled", ref: float = 0.9) -> dict:
+    """Lap-model inputs (% per lap) for one team at one circuit.
+
+    team_wear stores seconds on a 90 s lap, so divide by `ref` (0.9) to get %.
+    `soft` is the field model whose soft-tire speed and wear are used.
+    `which` picks the team's pooled, low, or high wear estimate.
+    """
+    p = {"fuel": field["fuel"], "offset_SOFT": soft["offset_SOFT"],
+         "offset_HARD": field["offset_HARD"],
+         "wear_SOFT": max(soft["deg_SOFT"], 0.0) * wear_factor}
+    for c in ["MEDIUM", "HARD"]:
+        row = team_wear[(team_wear["team"] == team) & (team_wear["compound"] == c)]
+        wear = row[which].iloc[0] / ref if len(row) else field[f"deg_{c}"]
+        p[f"wear_{c}"] = max(wear, 0.0) * wear_factor
+    return p
+
+
+def recommend_all(team_wear: pd.DataFrame, field: pd.Series, field_before: pd.Series,
+                  circuit: dict, caps: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Best plan for every team under both soft-tire assumptions.
+
+    Returns (recommendations, one-stop curves). The curves hold race time vs pit lap
+    for every one-stop plan, for the dashboard's interactive chart.
+    """
+    softs = {"historical": field_before, "this season": field}
+    recs, curves = [], []
+    for team in sorted(team_wear["team"].unique()):
+        for source, soft in softs.items():
+            def run(which="pooled"):
+                return simulate(team_params(team, team_wear, field, soft,
+                                            circuit["wear_factor"], which),
+                                circuit["laps"], circuit["base_lap"],
+                                circuit["pit_loss"], caps)
+            sims = run()
+            plans = best_plans(sims)
+            best, runner_up = plans.iloc[0], plans.iloc[1]
+            alt = {w: best_plans(run(w)).iloc[0]["plan"] for w in ["low", "high"]}
+            one = plans[plans["stops"] == 1]["vs_best"].min()
+            two = plans[plans["stops"] == 2]["vs_best"].min()
+            recs.append({
+                "team": team, "soft_source": source,
+                "best_plan": best["plan"], "order": best["best order"],
+                "stops": int(best["stops"]),
+                "pit_laps": ", ".join(map(str, best["pit_laps"])),
+                "window": best["window"], "next_best": runner_up["plan"],
+                "margin_s": float(runner_up["vs_best"]),
+                "one_vs_two_stop_s": float(two - one) if pd.notna(two) else None,
+                "robust": set(alt.values()) == {best["plan"]},
+                "if_low_wear": alt["low"], "if_high_wear": alt["high"],
+            })
+            o = sims[sims["stops"] == 1].copy()
+            o["pit_lap"] = o["pit_laps"].str[0]
+            o["best_two_stop"] = sims.loc[sims["stops"] == 2, "vs_best"].min()
+            curves.append(o[["plan", "pit_lap", "vs_best", "best_two_stop"]]
+                          .assign(team=team, soft_source=source))
+    return pd.DataFrame(recs), pd.concat(curves, ignore_index=True)

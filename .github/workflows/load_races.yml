@@ -54,6 +54,10 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
 
+      # Refresh team tire wear and next-race strategy from the new data
+      - name: Build model insights
+        run: python build_insights.py
+
       # Commit the new data files only if they changed. Streamlit Community Cloud
       # redeploys the app automatically whenever the repo changes.
       - name: Commit refreshed app data
